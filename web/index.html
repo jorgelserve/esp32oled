@@ -1,0 +1,403 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>ESP32 Tone Receiver</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <style>
+      :root {
+        color-scheme: light dark;
+      }
+      body {
+        font-family: system-ui, -apple-system, Segoe UI, sans-serif;
+        margin: 0;
+        padding: 1.5rem;
+        display: grid;
+        place-items: center;
+        min-height: 100vh;
+        background: radial-gradient(circle at top, #1e90ff22, transparent 60%);
+      }
+      main {
+        max-width: 480px;
+        border-radius: 16px;
+        box-shadow: 0 25px 60px -35px #000;
+        padding: 2rem;
+        background: rgba(255,255,255,0.65);
+        backdrop-filter: blur(6px);
+      }
+      h1 {
+        font-size: 1.6rem;
+        margin-top: 0;
+      }
+      .tone {
+        font-size: 2.8rem;
+        margin: 1rem 0;
+        line-height: 1.1;
+        font-weight: 600;
+      }
+      button {
+        font-size: 1rem;
+        padding: 0.75rem 1.5rem;
+        border: none;
+        border-radius: 999px;
+        cursor: pointer;
+        background: #1e90ff;
+        color: #fff;
+        transition: opacity 0.2s ease;
+        width: 100%;
+        margin-top: 1.25rem;
+      }
+      button:disabled {
+        opacity: 0.6;
+        cursor: default;
+      }
+      .controls {
+        margin-top: 1.5rem;
+      }
+      .slider-label {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.95rem;
+        margin-bottom: 0.5rem;
+        color: #0f172a;
+      }
+      input[type="range"] {
+        width: 100%;
+        accent-color: #1e90ff;
+      }
+      .normalized {
+        margin: 0.6rem 0 0.3rem;
+        font-size: 0.85rem;
+        color: #1f2937;
+      }
+      .range-inputs {
+        display: flex;
+        gap: 0.75rem;
+        margin-top: 0.75rem;
+      }
+      .range-inputs label {
+        flex: 1;
+        font-size: 0.8rem;
+        color: #334155;
+        display: flex;
+        flex-direction: column;
+        gap: 0.35rem;
+      }
+      .range-inputs input {
+        font-size: 1rem;
+        padding: 0.4rem 0.5rem;
+        border-radius: 10px;
+        border: 1px solid rgba(15,23,42,0.15);
+        background: rgba(255,255,255,0.75);
+      }
+      .status {
+        font-size: 0.95rem;
+        margin-top: 1.5rem;
+        line-height: 1.4;
+      }
+      .log {
+        font-family: ui-monospace, SFMono-Regular, SFMono, Menlo, Consolas, "Liberation Mono", monospace;
+        font-size: 0.8rem;
+        margin-top: 1rem;
+        padding: 0.75rem;
+        border-radius: 10px;
+        background: rgba(30,144,255,0.08);
+        max-height: 200px;
+        overflow-y: auto;
+        white-space: pre-line;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>ESP32 Tone Receiver</h1>
+      <p>El valor de tono se comparte normalizado (0 &ndash; 1). Ajusta tu rango local y se mantendrá sincronizado en todos los dispositivos.</p>
+      <div class="tone" id="frequency">Waiting...</div>
+      <section class="controls">
+        <label class="slider-label" for="frequencySlider">
+          <span>Ajusta el tono</span>
+          <span id="sliderValue">-- Hz</span>
+        </label>
+        <input type="range" id="frequencySlider" min="0" max="1000" step="1" value="131" />
+        <p class="normalized">Valor normalizado: <span id="normalizedValue">0.000</span></p>
+        <div class="range-inputs">
+          <label>
+            Min (Hz)
+            <input type="number" id="minFrequency" min="1" value="120" />
+          </label>
+          <label>
+            Max (Hz)
+            <input type="number" id="maxFrequency" min="2" value="1200" />
+          </label>
+        </div>
+      </section>
+      <button id="enable">Enable Audio Output</button>
+      <p class="status">
+        <strong>Connection:</strong> <span id="connection">connecting...</span><br />
+        <strong>Last update:</strong> <span id="updated">never</span>
+      </p>
+      <div class="log" id="log"></div>
+    </main>
+    <script>
+      const connectionEl = document.getElementById("connection");
+      const updatedEl = document.getElementById("updated");
+      const frequencyEl = document.getElementById("frequency");
+      const enableButton = document.getElementById("enable");
+      const logEl = document.getElementById("log");
+      const slider = document.getElementById("frequencySlider");
+      const sliderValueEl = document.getElementById("sliderValue");
+      const normalizedValueEl = document.getElementById("normalizedValue");
+      const minInput = document.getElementById("minFrequency");
+      const maxInput = document.getElementById("maxFrequency");
+
+      let audioContext;
+      let oscillator;
+      let gainNode;
+      let websocket;
+
+      const NORMALIZED_SCALE = 1000;
+      const state = {
+        normalized: Number(slider.value) / NORMALIZED_SCALE,
+        lastBroadcastedScaled: Number.NaN,
+        pendingSend: null,
+        queuedNormalized: null,
+        applyingRemoteUpdate: false,
+      };
+
+      let bounds = null;
+
+      function log(message) {
+        const now = new Date().toLocaleTimeString();
+        logEl.textContent = `[${now}] ${message}
+` + logEl.textContent;
+      }
+
+      function ensureAudioChain() {
+        if (!audioContext) {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          oscillator = audioContext.createOscillator();
+          oscillator.type = "sine";
+          gainNode = audioContext.createGain();
+          gainNode.gain.value = 0;
+          oscillator.connect(gainNode).connect(audioContext.destination);
+          oscillator.start();
+        }
+        if (audioContext.state === "suspended") {
+          audioContext.resume().catch(() => {});
+        }
+        if (audioContext.state === "running" && !enableButton.disabled) {
+          enableButton.disabled = true;
+          enableButton.textContent = "Audio Ready";
+        }
+      }
+
+      function clampNormalized(value) {
+        if (!Number.isFinite(value)) {
+          return 0;
+        }
+        return Math.min(Math.max(value, 0), 1);
+      }
+
+      function sanitizeBounds(changed) {
+        let minVal = parseFloat(minInput.value);
+        let maxVal = parseFloat(maxInput.value);
+
+        if (!Number.isFinite(minVal)) {
+          minVal = 120;
+        }
+        if (!Number.isFinite(maxVal)) {
+          maxVal = 1200;
+        }
+
+        if (minVal < 1) {
+          minVal = 1;
+        }
+
+        if (minVal >= maxVal) {
+          if (changed === "min") {
+            maxVal = minVal + 1;
+          } else {
+            minVal = maxVal - 1;
+            if (minVal < 1) {
+              minVal = 1;
+            }
+          }
+        }
+
+        minVal = Math.round(minVal);
+        maxVal = Math.round(maxVal);
+
+        minInput.value = String(minVal);
+        maxInput.value = String(maxVal);
+        bounds = { min: minVal, max: maxVal };
+        return bounds;
+      }
+
+      function getBounds() {
+        if (!bounds) {
+          return sanitizeBounds();
+        }
+        return bounds;
+      }
+
+      function frequencyFromNormalized(normalized) {
+        const { min, max } = getBounds();
+        const span = Math.max(max - min, 1);
+        return min + clampNormalized(normalized) * span;
+      }
+
+      function updateDisplayFromNormalized(normalized) {
+        const visibleFrequency = frequencyFromNormalized(normalized);
+        frequencyEl.textContent = `${visibleFrequency.toFixed(2)} Hz`;
+        sliderValueEl.textContent = `${visibleFrequency.toFixed(2)} Hz`;
+        normalizedValueEl.textContent = normalized.toFixed(3);
+        ensureAudioChain();
+        oscillator.frequency.setTargetAtTime(visibleFrequency, audioContext.currentTime, 0.01);
+        gainNode.gain.setTargetAtTime(0.18, audioContext.currentTime, 0.02);
+        updatedEl.textContent = new Date().toLocaleTimeString();
+      }
+
+      function pushNormalized(normalized, options = {}) {
+        const { force = false } = options;
+        const sanitized = clampNormalized(normalized);
+        const scaled = Math.round(sanitized * NORMALIZED_SCALE);
+        if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+          state.queuedNormalized = sanitized;
+          return;
+        }
+        if (!force && Number.isFinite(state.lastBroadcastedScaled) && state.lastBroadcastedScaled === scaled) {
+          return;
+        }
+        websocket.send(sanitized.toFixed(4));
+        state.lastBroadcastedScaled = scaled;
+        state.queuedNormalized = null;
+        log(`Valor normalizado enviado: ${sanitized.toFixed(3)}`);
+      }
+
+      function queueNormalizedBroadcast(normalized) {
+        state.normalized = normalized;
+        if (state.pendingSend) {
+          clearTimeout(state.pendingSend);
+        }
+        state.pendingSend = setTimeout(() => {
+          state.pendingSend = null;
+          pushNormalized(state.normalized);
+        }, 120);
+      }
+
+      function flushNormalizedBroadcast() {
+        if (state.pendingSend) {
+          clearTimeout(state.pendingSend);
+          state.pendingSend = null;
+        }
+        pushNormalized(state.normalized);
+      }
+
+      function handleSliderInput() {
+        if (state.applyingRemoteUpdate) {
+          return;
+        }
+        const normalized = clampNormalized(Number(slider.value) / NORMALIZED_SCALE);
+        state.normalized = normalized;
+        updateDisplayFromNormalized(normalized);
+        queueNormalizedBroadcast(normalized);
+      }
+
+      slider.addEventListener("input", handleSliderInput);
+      slider.addEventListener("change", flushNormalizedBroadcast);
+      ["pointerup", "touchend", "mouseup"].forEach((evt) => {
+        slider.addEventListener(evt, flushNormalizedBroadcast, { passive: true });
+      });
+
+      function handleBoundsChange(source) {
+        sanitizeBounds(source);
+        updateDisplayFromNormalized(state.normalized);
+      }
+
+      minInput.addEventListener("change", () => handleBoundsChange("min"));
+      minInput.addEventListener("input", () => {
+        sanitizeBounds("min");
+        updateDisplayFromNormalized(state.normalized);
+      });
+      maxInput.addEventListener("change", () => handleBoundsChange("max"));
+      maxInput.addEventListener("input", () => {
+        sanitizeBounds("max");
+        updateDisplayFromNormalized(state.normalized);
+      });
+
+      enableButton.addEventListener("click", () => {
+        ensureAudioChain();
+        gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
+        enableButton.disabled = true;
+        enableButton.textContent = "Audio Ready";
+        log("Audio output enabled by user");
+      });
+
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden" && audioContext) {
+          audioContext.resume().catch(() => {});
+        }
+      });
+
+      window.addEventListener("focus", () => {
+        if (audioContext && audioContext.state === "suspended") {
+          audioContext.resume().catch(() => {});
+        }
+      });
+
+      function connectWebSocket() {
+        const protocol = location.protocol === "https:" ? "wss" : "ws";
+        websocket = new WebSocket(`${protocol}://${location.hostname}:${81}/`);
+        websocket.onopen = () => {
+          connectionEl.textContent = "connected";
+          connectionEl.style.color = "green";
+          log("WebSocket connected");
+          pushNormalized(state.normalized, { force: true });
+          if (state.queuedNormalized !== null) {
+            pushNormalized(state.queuedNormalized, { force: true });
+          }
+        };
+        websocket.onclose = () => {
+          connectionEl.textContent = "disconnected (retrying...)";
+          connectionEl.style.color = "red";
+          log("WebSocket disconnected; retrying in 2s");
+          setTimeout(connectWebSocket, 2000);
+        };
+        websocket.onerror = (error) => {
+          log(`Socket error: ${error.message || error}`);
+        };
+        websocket.onmessage = (event) => {
+          const parsed = parseFloat(event.data);
+          if (!Number.isFinite(parsed)) {
+            log(`Ignored non-numeric payload: ${event.data}`);
+            return;
+          }
+          const normalized = clampNormalized(parsed);
+          const scaled = Math.round(normalized * NORMALIZED_SCALE);
+          const previous = state.lastBroadcastedScaled;
+          state.lastBroadcastedScaled = scaled;
+          state.normalized = normalized;
+          if (state.pendingSend) {
+            clearTimeout(state.pendingSend);
+            state.pendingSend = null;
+          }
+          state.queuedNormalized = null;
+          state.applyingRemoteUpdate = true;
+          slider.value = String(scaled);
+          state.applyingRemoteUpdate = false;
+          updateDisplayFromNormalized(normalized);
+          if (!Number.isFinite(previous) || previous !== scaled) {
+            log(`Valor sincronizado: ${normalized.toFixed(3)}`);
+          }
+        };
+      }
+
+      sanitizeBounds();
+      state.normalized = clampNormalized(state.normalized);
+      slider.value = String(Math.round(state.normalized * NORMALIZED_SCALE));
+      updateDisplayFromNormalized(state.normalized);
+
+      connectWebSocket();
+    </script>
+  </body>
+</html>

@@ -3,6 +3,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
+#include "web_bundle.h"
 
 // ********** Access Point configuration **********
 // The ESP32 runs as an AP so no external Wi-Fi credentials are required.
@@ -16,410 +17,7 @@ const IPAddress AP_SUBNET(255, 255, 255, 0);
 // ********** Web resources **********
 constexpr uint16_t kWebSocketPort = 81;
 
-const char INDEX_HTML[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <title>ESP32 Tone Receiver</title>
-    <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <style>
-      :root {
-        color-scheme: light dark;
-      }
-      body {
-        font-family: system-ui, -apple-system, Segoe UI, sans-serif;
-        margin: 0;
-        padding: 1.5rem;
-        display: grid;
-        place-items: center;
-        min-height: 100vh;
-        background: radial-gradient(circle at top, #1e90ff22, transparent 60%);
-      }
-      main {
-        max-width: 460px;
-        border-radius: 16px;
-        box-shadow: 0 25px 60px -35px #000;
-        padding: 2rem;
-        background: rgba(255,255,255,0.65);
-        backdrop-filter: blur(6px);
-      }
-      h1 {
-        font-size: 1.6rem;
-        margin-top: 0;
-      }
-      .tone {
-        font-size: 2.8rem;
-        margin: 1rem 0;
-        line-height: 1.1;
-        font-weight: 600;
-      }
-      button {
-        font-size: 1rem;
-        padding: 0.75rem 1.5rem;
-        border: none;
-        border-radius: 999px;
-        cursor: pointer;
-        background: #1e90ff;
-        color: #fff;
-        transition: opacity 0.2s ease;
-        width: 100%;
-        margin-top: 1rem;
-      }
-      button:disabled {
-        opacity: 0.6;
-        cursor: default;
-      }
-      .controls {
-        margin-top: 1.5rem;
-      }
-      .slider-label {
-        display: flex;
-        justify-content: space-between;
-        font-size: 0.95rem;
-        margin-bottom: 0.5rem;
-        color: #0f172a;
-      }
-      input[type="range"] {
-        width: 100%;
-        accent-color: #1e90ff;
-      }
-      .range-inputs {
-        display: flex;
-        gap: 0.75rem;
-        margin-top: 0.75rem;
-      }
-      .range-inputs label {
-        flex: 1;
-        font-size: 0.8rem;
-        color: #334155;
-        display: flex;
-        flex-direction: column;
-        gap: 0.35rem;
-      }
-      .range-inputs input {
-        font-size: 1rem;
-        padding: 0.4rem 0.5rem;
-        border-radius: 10px;
-        border: 1px solid rgba(15,23,42,0.15);
-        background: rgba(255,255,255,0.75);
-      }
-      .status {
-        font-size: 0.95rem;
-        margin-top: 1.5rem;
-        line-height: 1.4;
-      }
-      .log {
-        font-family: ui-monospace, SFMono-Regular, SFMono, Menlo, Consolas, "Liberation Mono", monospace;
-        font-size: 0.8rem;
-        margin-top: 1rem;
-        padding: 0.75rem;
-        border-radius: 10px;
-        background: rgba(30,144,255,0.08);
-        max-height: 200px;
-        overflow-y: auto;
-        white-space: pre-line;
-      }
-    </style>
-  </head>
-  <body>
-    <main>
-      <h1>ESP32 Tone Receiver</h1>
-      <p>Controla el tono desde cualquier dispositivo conectado. Ajusta la frecuencia con el control deslizante y se sincronizará en tiempo real.</p>
-      <div class="tone" id="frequency">Waiting...</div>
-      <section class="controls">
-        <label class="slider-label" for="frequencySlider">
-          <span>Ajusta la frecuencia</span>
-          <span id="sliderValue">440 Hz</span>
-        </label>
-        <input type="range" id="frequencySlider" min="120" max="1200" step="1" value="440" />
-        <div class="range-inputs">
-          <label>
-            Min (Hz)
-            <input type="number" id="minFrequency" min="1" value="120" />
-          </label>
-          <label>
-            Max (Hz)
-            <input type="number" id="maxFrequency" min="2" value="1200" />
-          </label>
-        </div>
-      </section>
-      <button id="enable">Enable Audio Output</button>
-      <p class="status">
-        <strong>Connection:</strong> <span id="connection">connecting...</span><br />
-        <strong>Last update:</strong> <span id="updated">never</span>
-      </p>
-      <div class="log" id="log"></div>
-    </main>
-    <script>
-      const connectionEl = document.getElementById("connection");
-      const updatedEl = document.getElementById("updated");
-      const frequencyEl = document.getElementById("frequency");
-      const enableButton = document.getElementById("enable");
-      const logEl = document.getElementById("log");
-      const slider = document.getElementById("frequencySlider");
-      const sliderValueEl = document.getElementById("sliderValue");
-      const minInput = document.getElementById("minFrequency");
-      const maxInput = document.getElementById("maxFrequency");
 
-      let audioContext;
-      let oscillator;
-      let gainNode;
-      let websocket;
-
-      const state = {
-        desiredFrequency: Number(slider.value),
-        lastBroadcastedFrequency: Number.NaN,
-        pendingSend: null,
-        queuedFrequency: null,
-        applyingRemoteUpdate: false,
-      };
-
-      function log(message) {
-        const now = new Date().toLocaleTimeString();
-        logEl.textContent = `[${now}] ${message}
-` + logEl.textContent;
-      }
-
-      function ensureAudioChain() {
-        if (!audioContext) {
-          audioContext = new (window.AudioContext || window.webkitAudioContext)();
-          oscillator = audioContext.createOscillator();
-          oscillator.type = "sine";
-          gainNode = audioContext.createGain();
-          gainNode.gain.value = 0;
-          oscillator.connect(gainNode).connect(audioContext.destination);
-          oscillator.start();
-        }
-        if (audioContext.state === "suspended") {
-          audioContext.resume().catch(() => {});
-        }
-        if (audioContext.state === "running" && !enableButton.disabled) {
-          enableButton.disabled = true;
-          enableButton.textContent = "Audio Ready";
-        }
-      }
-
-      function playFrequency(freq) {
-        ensureAudioChain();
-        const frequencyValue = Number(freq);
-        frequencyEl.textContent = `${frequencyValue.toFixed(2)} Hz`;
-        sliderValueEl.textContent = `${frequencyValue.toFixed(0)} Hz`;
-        oscillator.frequency.setTargetAtTime(frequencyValue, audioContext.currentTime, 0.01);
-        gainNode.gain.setTargetAtTime(0.18, audioContext.currentTime, 0.02);
-        updatedEl.textContent = new Date().toLocaleTimeString();
-      }
-
-      function sanitizeBounds(changed) {
-        let minVal = parseInt(minInput.value, 10);
-        let maxVal = parseInt(maxInput.value, 10);
-
-        if (!Number.isFinite(minVal)) {
-          minVal = Number(slider.min) || 120;
-        }
-        if (!Number.isFinite(maxVal)) {
-          maxVal = Number(slider.max) || 1200;
-        }
-
-        if (minVal < 1) {
-          minVal = 1;
-        }
-
-        if (minVal >= maxVal) {
-          if (changed === "min") {
-            maxVal = minVal + 1;
-            maxInput.value = Math.round(maxVal);
-          } else {
-            minVal = maxVal - 1;
-            if (minVal < 1) {
-              minVal = 1;
-            }
-            minInput.value = Math.round(minVal);
-          }
-        }
-
-        minVal = Math.round(minVal);
-        maxVal = Math.round(maxVal);
-
-        minInput.value = String(minVal);
-        maxInput.value = String(maxVal);
-        slider.min = String(minVal);
-        slider.max = String(maxVal);
-
-        return { min: minVal, max: maxVal };
-      }
-
-      function clampToBounds(freq) {
-        const minVal = Number(slider.min);
-        const maxVal = Number(slider.max);
-        const rounded = Math.round(freq);
-        return Math.min(Math.max(rounded, minVal), maxVal);
-      }
-
-      function extendBoundsToFit(freq) {
-        const minVal = Number(slider.min);
-        const maxVal = Number(slider.max);
-        let changed = false;
-
-        if (freq < minVal) {
-          minInput.value = String(Math.max(1, Math.floor(freq)));
-          changed = true;
-        }
-        if (freq > maxVal) {
-          maxInput.value = String(Math.ceil(freq));
-          changed = true;
-        }
-        if (changed) {
-          sanitizeBounds();
-        }
-      }
-
-      function pushFrequency(freq, options = {}) {
-        const { force = false } = options;
-        const sanitized = clampToBounds(freq);
-        if (!websocket || websocket.readyState !== WebSocket.OPEN) {
-          state.queuedFrequency = sanitized;
-          return;
-        }
-        if (!force && Number.isFinite(state.lastBroadcastedFrequency) && state.lastBroadcastedFrequency === sanitized) {
-          return;
-        }
-        websocket.send(`freq:${sanitized}`);
-        state.lastBroadcastedFrequency = sanitized;
-        state.queuedFrequency = null;
-        log(`Frecuencia enviada: ${sanitized} Hz`);
-      }
-
-      function queueFrequencyBroadcast(freq) {
-        state.desiredFrequency = freq;
-        if (state.pendingSend) {
-          clearTimeout(state.pendingSend);
-        }
-        state.pendingSend = setTimeout(() => {
-          state.pendingSend = null;
-          pushFrequency(state.desiredFrequency);
-        }, 120);
-      }
-
-      function flushFrequencyBroadcast() {
-        if (state.pendingSend) {
-          clearTimeout(state.pendingSend);
-          state.pendingSend = null;
-        }
-        pushFrequency(state.desiredFrequency);
-      }
-
-      function handleSliderInput() {
-        if (state.applyingRemoteUpdate) {
-          return;
-        }
-        const freq = clampToBounds(Number(slider.value));
-        state.desiredFrequency = freq;
-        playFrequency(freq);
-        queueFrequencyBroadcast(freq);
-      }
-
-      slider.addEventListener("input", handleSliderInput);
-      slider.addEventListener("change", flushFrequencyBroadcast);
-      ["pointerup", "touchend", "mouseup"].forEach((evt) => {
-        slider.addEventListener(evt, flushFrequencyBroadcast, { passive: true });
-      });
-
-      function handleBoundsChange(source) {
-        sanitizeBounds(source);
-        const clamped = clampToBounds(state.desiredFrequency);
-        if (clamped !== state.desiredFrequency) {
-          state.desiredFrequency = clamped;
-          state.applyingRemoteUpdate = true;
-          slider.value = String(clamped);
-          state.applyingRemoteUpdate = false;
-          playFrequency(clamped);
-          queueFrequencyBroadcast(clamped);
-        }
-      }
-
-      minInput.addEventListener("change", () => handleBoundsChange("min"));
-      minInput.addEventListener("input", () => sanitizeBounds("min"));
-      maxInput.addEventListener("change", () => handleBoundsChange("max"));
-      maxInput.addEventListener("input", () => sanitizeBounds("max"));
-
-      enableButton.addEventListener("click", () => {
-        ensureAudioChain();
-        gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
-        enableButton.disabled = true;
-        enableButton.textContent = "Audio Ready";
-        log("Audio output enabled by user");
-      });
-
-      document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "hidden" && audioContext) {
-          audioContext.resume().catch(() => {});
-        }
-      });
-
-      window.addEventListener("focus", () => {
-        if (audioContext && audioContext.state === "suspended") {
-          audioContext.resume().catch(() => {});
-        }
-      });
-
-      function connectWebSocket() {
-        const protocol = location.protocol === "https:" ? "wss" : "ws";
-        websocket = new WebSocket(`${protocol}://${location.hostname}:${81}/`);
-        websocket.onopen = () => {
-          connectionEl.textContent = "connected";
-          connectionEl.style.color = "green";
-          log("WebSocket connected");
-          pushFrequency(state.desiredFrequency, { force: true });
-          if (state.queuedFrequency !== null) {
-            pushFrequency(state.queuedFrequency, { force: true });
-          }
-        };
-        websocket.onclose = () => {
-          connectionEl.textContent = "disconnected (retrying...)";
-          connectionEl.style.color = "red";
-          log("WebSocket disconnected; retrying in 2s");
-          setTimeout(connectWebSocket, 2000);
-        };
-        websocket.onerror = (error) => {
-          log(`Socket error: ${error.message || error}`);
-        };
-        websocket.onmessage = (event) => {
-          const freq = parseFloat(event.data);
-          if (!Number.isFinite(freq)) {
-            log(`Ignored non-numeric payload: ${event.data}`);
-            return;
-          }
-          const previous = state.lastBroadcastedFrequency;
-          extendBoundsToFit(freq);
-          const sanitized = clampToBounds(freq);
-          state.desiredFrequency = sanitized;
-          state.lastBroadcastedFrequency = sanitized;
-          if (state.pendingSend) {
-            clearTimeout(state.pendingSend);
-            state.pendingSend = null;
-          }
-          state.queuedFrequency = null;
-          state.applyingRemoteUpdate = true;
-          slider.value = String(sanitized);
-          state.applyingRemoteUpdate = false;
-          playFrequency(sanitized);
-          if (!Number.isFinite(previous) || previous !== sanitized) {
-            log(`Frecuencia sincronizada: ${sanitized} Hz`);
-          }
-        };
-      }
-
-      sanitizeBounds();
-      state.desiredFrequency = clampToBounds(state.desiredFrequency);
-      slider.value = String(state.desiredFrequency);
-      sliderValueEl.textContent = `${state.desiredFrequency} Hz`;
-
-      connectWebSocket();
-    </script>
-  </body>
-</html>
-)rawliteral";
 
 // ********** UI helpers **********
 class OledDisplay {
@@ -526,45 +124,79 @@ WebSocketsServer webSocket(kWebSocketPort);
 
 const uint16_t toneFrequencies[] = {261, 329, 392, 440, 523, 659};
 constexpr size_t toneCount = sizeof(toneFrequencies) / sizeof(toneFrequencies[0]);
+constexpr float kDefaultRangeMinHz = 120.0f;
+constexpr float kDefaultRangeMaxHz = 1200.0f;
+constexpr uint16_t kNormalizedScale = 1000;  // Precision for debouncing broadcasts
+
+float currentNormalizedValue = 0.0f;
 size_t currentToneIndex = 0;
-String lastFrequencyStr = String(toneFrequencies[0]);
-constexpr uint16_t kFrequencyMin = 60;   // Guard rails for inbound frequency commands
-constexpr uint16_t kFrequencyMax = 5000; // Upper bound to avoid abusive values
-uint16_t lastBroadcastFrequency = toneFrequencies[0];
+String lastNormalizedStr = String("0.0000");
+uint16_t lastBroadcastNormalizedScaled = kNormalizedScale + 1;
 String ipString = "0.0.0.0";
 volatile uint8_t apClientCount = 0;
 uint16_t connectedClientCount = 0;
 bool apReady = false;
 
 // ********** Forward declarations **********
-void broadcastFrequency(uint16_t frequency, bool force = false);
+void broadcastNormalizedValue(float normalized, bool force = false);
 void refreshDisplay();
 void handleWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t *payload, size_t length);
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
-bool tryParseFrequencyCommand(const String &payload, uint16_t &frequencyOut);
+bool tryParseNormalizedCommand(const String &payload, float &normalizedOut);
 size_t findClosestToneIndex(uint16_t frequency);
+float frequencyToNormalized(float frequency);
+float normalizedToFrequency(float normalized);
 
 void refreshDisplay() {
   const String line1 = apReady ? String("AP: ") + AP_SSID : "AP: starting...";
-  const String line2 = "IP: " + ipString;
-  String line3 = "Tone: " + lastFrequencyStr + " Hz";
+  const float displayFrequency = normalizedToFrequency(currentNormalizedValue);
+  String line2 = "IP: " + ipString;
+  String line3 = "N:" + String(currentNormalizedValue, 2) + " F:" + String(displayFrequency, 0);
   if (apClientCount > 0 || connectedClientCount > 0) {
     line3 += " C:" + String(apClientCount) + "/" + String(connectedClientCount);
   }
   display.showLines(line1, line2, line3);
 }
 
-void broadcastFrequency(uint16_t frequency, bool force) {
-  if (!force && frequency == lastBroadcastFrequency) {
+float clampNormalized(float value) {
+  if (value < 0.0f) {
+    return 0.0f;
+  }
+  if (value > 1.0f) {
+    return 1.0f;
+  }
+  return value;
+}
+
+float frequencyToNormalized(float frequency) {
+  const float span = kDefaultRangeMaxHz - kDefaultRangeMinHz;
+  if (span <= 0.0f) {
+    return 0.0f;
+  }
+  const float normalized = (frequency - kDefaultRangeMinHz) / span;
+  return clampNormalized(normalized);
+}
+
+float normalizedToFrequency(float normalized) {
+  const float span = kDefaultRangeMaxHz - kDefaultRangeMinHz;
+  return kDefaultRangeMinHz + clampNormalized(normalized) * span;
+}
+
+void broadcastNormalizedValue(float normalized, bool force) {
+  const float sanitized = clampNormalized(normalized);
+  const uint16_t scaled = static_cast<uint16_t>(sanitized * kNormalizedScale + 0.5f);
+  if (!force && scaled == lastBroadcastNormalizedScaled) {
     return;
   }
-  lastBroadcastFrequency = frequency;
-  lastFrequencyStr = String(frequency);
-  webSocket.broadcastTXT(lastFrequencyStr);
+
+  lastBroadcastNormalizedScaled = scaled;
+  currentNormalizedValue = sanitized;
+  lastNormalizedStr = String(sanitized, 4);
+  webSocket.broadcastTXT(lastNormalizedStr);
   refreshDisplay();
 }
 
-bool tryParseFrequencyCommand(const String &payload, uint16_t &frequencyOut) {
+bool tryParseNormalizedCommand(const String &payload, float &normalizedOut) {
   String trimmed = payload;
   trimmed.trim();
   if (trimmed.length() == 0) {
@@ -581,7 +213,7 @@ bool tryParseFrequencyCommand(const String &payload, uint16_t &frequencyOut) {
   String numericPortion;
   if (separatorIndex > 0) {
     const String key = lower.substring(0, separatorIndex);
-    if (key != "freq" && key != "frequency") {
+    if (key != "val" && key != "value" && key != "norm" && key != "normalized") {
       return false;
     }
     numericPortion = trimmed.substring(separatorIndex + 1);
@@ -595,18 +227,11 @@ bool tryParseFrequencyCommand(const String &payload, uint16_t &frequencyOut) {
   }
 
   const float parsed = numericPortion.toFloat();
-  if (!(parsed > 0.0f)) {
+  if (!(parsed >= 0.0f)) {
     return false;
   }
 
-  uint16_t frequencyCandidate = static_cast<uint16_t>(parsed + 0.5f);
-  if (frequencyCandidate < kFrequencyMin) {
-    frequencyCandidate = kFrequencyMin;
-  } else if (frequencyCandidate > kFrequencyMax) {
-    frequencyCandidate = kFrequencyMax;
-  }
-
-  frequencyOut = frequencyCandidate;
+  normalizedOut = clampNormalized(parsed);
   return true;
 }
 
@@ -658,7 +283,7 @@ void handleWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t *payload, si
     case WStype_CONNECTED: {
       IPAddress ip = webSocket.remoteIP(clientNum);
       Serial.printf("WebSocket client #%u connected from %s\n", clientNum, ip.toString().c_str());
-      webSocket.sendTXT(clientNum, lastFrequencyStr);
+      webSocket.sendTXT(clientNum, lastNormalizedStr);
       connectedClientCount = webSocket.connectedClients();
       refreshDisplay();
       break;
@@ -674,12 +299,14 @@ void handleWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t *payload, si
       Serial.printf("Received data from client #%u: %s\n", clientNum, payloadStr.c_str());
       if (payloadStr.equalsIgnoreCase("next")) {
         currentToneIndex = (currentToneIndex + 1) % toneCount;
-        broadcastFrequency(toneFrequencies[currentToneIndex]);
+        const float normalized = frequencyToNormalized(static_cast<float>(toneFrequencies[currentToneIndex]));
+        broadcastNormalizedValue(normalized);
       } else {
-        uint16_t requestedFrequency = 0;
-        if (tryParseFrequencyCommand(payloadStr, requestedFrequency)) {
-          currentToneIndex = findClosestToneIndex(requestedFrequency);
-          broadcastFrequency(requestedFrequency);
+        float requestedNormalized = 0.0f;
+        if (tryParseNormalizedCommand(payloadStr, requestedNormalized)) {
+          const float requestedFrequency = normalizedToFrequency(requestedNormalized);
+          currentToneIndex = findClosestToneIndex(static_cast<uint16_t>(requestedFrequency + 0.5f));
+          broadcastNormalizedValue(requestedNormalized);
         }
       }
       connectedClientCount = webSocket.connectedClients();
@@ -705,7 +332,10 @@ void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
 
 void setupWebServer() {
   server.on("/", HTTP_GET, []() {
-    server.send_P(200, "text/html; charset=utf-8", INDEX_HTML);
+    server.sendHeader("Content-Encoding", "gzip");
+    server.sendHeader("Cache-Control", "public, max-age=86400");
+    server.sendHeader("ETag", FPSTR(INDEX_HTML_SHA1));
+    server.send_P(200, "text/html; charset=utf-8", reinterpret_cast<const char *>(INDEX_HTML_GZ), INDEX_HTML_GZ_LEN);
   });
   server.onNotFound([]() {
     server.send(404, "text/plain", "Not Found");
@@ -730,7 +360,8 @@ void setup() {
   startAccessPoint();
   setupWebServer();
 
-  broadcastFrequency(toneFrequencies[currentToneIndex], true);
+  currentNormalizedValue = frequencyToNormalized(static_cast<float>(toneFrequencies[currentToneIndex]));
+  broadcastNormalizedValue(currentNormalizedValue, true);
 }
 
 void loop() {
@@ -739,7 +370,8 @@ void loop() {
 
   if (selectorButton.wasPressed()) {
     currentToneIndex = (currentToneIndex + 1) % toneCount;
-    broadcastFrequency(toneFrequencies[currentToneIndex]);
+    const float normalized = frequencyToNormalized(static_cast<float>(toneFrequencies[currentToneIndex]));
+    broadcastNormalizedValue(normalized);
     statusLed.toggle();
   }
 }
