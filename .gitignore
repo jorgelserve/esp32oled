@@ -1,0 +1,21 @@
+# VSCode
+.vscode/
+
+# PlatformIO
+.pio/
+.platformio/
+
+# Build artifacts
+.elf
+.bin
+.hex
+.uf2
+/.sconsign*
+
+# Dependency directories
+libdeps/
+
+# Project-specific files to ignore
+.DS_Store
+.env
+*.log
