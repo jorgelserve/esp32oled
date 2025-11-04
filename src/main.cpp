@@ -15,6 +15,7 @@ const IPAddress AP_SUBNET(255, 255, 255, 0);
 
 // ********** Web resources **********
 constexpr uint16_t kWebSocketPort = 81;
+
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="en">
@@ -36,7 +37,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         background: radial-gradient(circle at top, #1e90ff22, transparent 60%);
       }
       main {
-        max-width: 420px;
+        max-width: 460px;
         border-radius: 16px;
         box-shadow: 0 25px 60px -35px #000;
         padding: 2rem;
@@ -61,10 +62,47 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         cursor: pointer;
         background: #1e90ff;
         color: #fff;
+        transition: opacity 0.2s ease;
+        width: 100%;
+        margin-top: 1rem;
       }
       button:disabled {
         opacity: 0.6;
         cursor: default;
+      }
+      .controls {
+        margin-top: 1.5rem;
+      }
+      .slider-label {
+        display: flex;
+        justify-content: space-between;
+        font-size: 0.95rem;
+        margin-bottom: 0.5rem;
+        color: #0f172a;
+      }
+      input[type="range"] {
+        width: 100%;
+        accent-color: #1e90ff;
+      }
+      .range-inputs {
+        display: flex;
+        gap: 0.75rem;
+        margin-top: 0.75rem;
+      }
+      .range-inputs label {
+        flex: 1;
+        font-size: 0.8rem;
+        color: #334155;
+        display: flex;
+        flex-direction: column;
+        gap: 0.35rem;
+      }
+      .range-inputs input {
+        font-size: 1rem;
+        padding: 0.4rem 0.5rem;
+        border-radius: 10px;
+        border: 1px solid rgba(15,23,42,0.15);
+        background: rgba(255,255,255,0.75);
       }
       .status {
         font-size: 0.95rem;
@@ -80,14 +118,32 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         background: rgba(30,144,255,0.08);
         max-height: 200px;
         overflow-y: auto;
+        white-space: pre-line;
       }
     </style>
   </head>
   <body>
     <main>
       <h1>ESP32 Tone Receiver</h1>
-      <p>The device dictates the tone frequency over WebSocket. Enable sound once, then leave this tab if you want—the audio keeps playing.</p>
+      <p>Controla el tono desde cualquier dispositivo conectado. Ajusta la frecuencia con el control deslizante y se sincronizará en tiempo real.</p>
       <div class="tone" id="frequency">Waiting...</div>
+      <section class="controls">
+        <label class="slider-label" for="frequencySlider">
+          <span>Ajusta la frecuencia</span>
+          <span id="sliderValue">440 Hz</span>
+        </label>
+        <input type="range" id="frequencySlider" min="120" max="1200" step="1" value="440" />
+        <div class="range-inputs">
+          <label>
+            Min (Hz)
+            <input type="number" id="minFrequency" min="1" value="120" />
+          </label>
+          <label>
+            Max (Hz)
+            <input type="number" id="maxFrequency" min="2" value="1200" />
+          </label>
+        </div>
+      </section>
       <button id="enable">Enable Audio Output</button>
       <p class="status">
         <strong>Connection:</strong> <span id="connection">connecting...</span><br />
@@ -101,15 +157,28 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       const frequencyEl = document.getElementById("frequency");
       const enableButton = document.getElementById("enable");
       const logEl = document.getElementById("log");
+      const slider = document.getElementById("frequencySlider");
+      const sliderValueEl = document.getElementById("sliderValue");
+      const minInput = document.getElementById("minFrequency");
+      const maxInput = document.getElementById("maxFrequency");
 
       let audioContext;
       let oscillator;
       let gainNode;
       let websocket;
 
+      const state = {
+        desiredFrequency: Number(slider.value),
+        lastBroadcastedFrequency: Number.NaN,
+        pendingSend: null,
+        queuedFrequency: null,
+        applyingRemoteUpdate: false,
+      };
+
       function log(message) {
         const now = new Date().toLocaleTimeString();
-        logEl.textContent = `[${now}] ${message}\n` + logEl.textContent;
+        logEl.textContent = `[${now}] ${message}
+` + logEl.textContent;
       }
 
       function ensureAudioChain() {
@@ -123,17 +192,176 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           oscillator.start();
         }
         if (audioContext.state === "suspended") {
-          audioContext.resume();
+          audioContext.resume().catch(() => {});
+        }
+        if (audioContext.state === "running" && !enableButton.disabled) {
+          enableButton.disabled = true;
+          enableButton.textContent = "Audio Ready";
         }
       }
 
       function playFrequency(freq) {
         ensureAudioChain();
-        frequencyEl.textContent = `${Number(freq).toFixed(2)} Hz`;
-        oscillator.frequency.setTargetAtTime(freq, audioContext.currentTime, 0.01);
+        const frequencyValue = Number(freq);
+        frequencyEl.textContent = `${frequencyValue.toFixed(2)} Hz`;
+        sliderValueEl.textContent = `${frequencyValue.toFixed(0)} Hz`;
+        oscillator.frequency.setTargetAtTime(frequencyValue, audioContext.currentTime, 0.01);
         gainNode.gain.setTargetAtTime(0.18, audioContext.currentTime, 0.02);
         updatedEl.textContent = new Date().toLocaleTimeString();
       }
+
+      function sanitizeBounds(changed) {
+        let minVal = parseInt(minInput.value, 10);
+        let maxVal = parseInt(maxInput.value, 10);
+
+        if (!Number.isFinite(minVal)) {
+          minVal = Number(slider.min) || 120;
+        }
+        if (!Number.isFinite(maxVal)) {
+          maxVal = Number(slider.max) || 1200;
+        }
+
+        if (minVal < 1) {
+          minVal = 1;
+        }
+
+        if (minVal >= maxVal) {
+          if (changed === "min") {
+            maxVal = minVal + 1;
+            maxInput.value = Math.round(maxVal);
+          } else {
+            minVal = maxVal - 1;
+            if (minVal < 1) {
+              minVal = 1;
+            }
+            minInput.value = Math.round(minVal);
+          }
+        }
+
+        minVal = Math.round(minVal);
+        maxVal = Math.round(maxVal);
+
+        minInput.value = String(minVal);
+        maxInput.value = String(maxVal);
+        slider.min = String(minVal);
+        slider.max = String(maxVal);
+
+        return { min: minVal, max: maxVal };
+      }
+
+      function clampToBounds(freq) {
+        const minVal = Number(slider.min);
+        const maxVal = Number(slider.max);
+        const rounded = Math.round(freq);
+        return Math.min(Math.max(rounded, minVal), maxVal);
+      }
+
+      function extendBoundsToFit(freq) {
+        const minVal = Number(slider.min);
+        const maxVal = Number(slider.max);
+        let changed = false;
+
+        if (freq < minVal) {
+          minInput.value = String(Math.max(1, Math.floor(freq)));
+          changed = true;
+        }
+        if (freq > maxVal) {
+          maxInput.value = String(Math.ceil(freq));
+          changed = true;
+        }
+        if (changed) {
+          sanitizeBounds();
+        }
+      }
+
+      function pushFrequency(freq, options = {}) {
+        const { force = false } = options;
+        const sanitized = clampToBounds(freq);
+        if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+          state.queuedFrequency = sanitized;
+          return;
+        }
+        if (!force && Number.isFinite(state.lastBroadcastedFrequency) && state.lastBroadcastedFrequency === sanitized) {
+          return;
+        }
+        websocket.send(`freq:${sanitized}`);
+        state.lastBroadcastedFrequency = sanitized;
+        state.queuedFrequency = null;
+        log(`Frecuencia enviada: ${sanitized} Hz`);
+      }
+
+      function queueFrequencyBroadcast(freq) {
+        state.desiredFrequency = freq;
+        if (state.pendingSend) {
+          clearTimeout(state.pendingSend);
+        }
+        state.pendingSend = setTimeout(() => {
+          state.pendingSend = null;
+          pushFrequency(state.desiredFrequency);
+        }, 120);
+      }
+
+      function flushFrequencyBroadcast() {
+        if (state.pendingSend) {
+          clearTimeout(state.pendingSend);
+          state.pendingSend = null;
+        }
+        pushFrequency(state.desiredFrequency);
+      }
+
+      function handleSliderInput() {
+        if (state.applyingRemoteUpdate) {
+          return;
+        }
+        const freq = clampToBounds(Number(slider.value));
+        state.desiredFrequency = freq;
+        playFrequency(freq);
+        queueFrequencyBroadcast(freq);
+      }
+
+      slider.addEventListener("input", handleSliderInput);
+      slider.addEventListener("change", flushFrequencyBroadcast);
+      ["pointerup", "touchend", "mouseup"].forEach((evt) => {
+        slider.addEventListener(evt, flushFrequencyBroadcast, { passive: true });
+      });
+
+      function handleBoundsChange(source) {
+        sanitizeBounds(source);
+        const clamped = clampToBounds(state.desiredFrequency);
+        if (clamped !== state.desiredFrequency) {
+          state.desiredFrequency = clamped;
+          state.applyingRemoteUpdate = true;
+          slider.value = String(clamped);
+          state.applyingRemoteUpdate = false;
+          playFrequency(clamped);
+          queueFrequencyBroadcast(clamped);
+        }
+      }
+
+      minInput.addEventListener("change", () => handleBoundsChange("min"));
+      minInput.addEventListener("input", () => sanitizeBounds("min"));
+      maxInput.addEventListener("change", () => handleBoundsChange("max"));
+      maxInput.addEventListener("input", () => sanitizeBounds("max"));
+
+      enableButton.addEventListener("click", () => {
+        ensureAudioChain();
+        gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
+        enableButton.disabled = true;
+        enableButton.textContent = "Audio Ready";
+        log("Audio output enabled by user");
+      });
+
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState === "hidden" && audioContext) {
+          audioContext.resume().catch(() => {});
+        }
+      });
+
+      window.addEventListener("focus", () => {
+        if (audioContext && audioContext.state === "suspended") {
+          audioContext.resume().catch(() => {});
+        }
+      });
 
       function connectWebSocket() {
         const protocol = location.protocol === "https:" ? "wss" : "ws";
@@ -142,6 +370,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           connectionEl.textContent = "connected";
           connectionEl.style.color = "green";
           log("WebSocket connected");
+          pushFrequency(state.desiredFrequency, { force: true });
+          if (state.queuedFrequency !== null) {
+            pushFrequency(state.queuedFrequency, { force: true });
+          }
         };
         websocket.onclose = () => {
           connectionEl.textContent = "disconnected (retrying...)";
@@ -154,33 +386,34 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         };
         websocket.onmessage = (event) => {
           const freq = parseFloat(event.data);
-          if (!isFinite(freq)) {
+          if (!Number.isFinite(freq)) {
             log(`Ignored non-numeric payload: ${event.data}`);
             return;
           }
-          playFrequency(freq);
+          const previous = state.lastBroadcastedFrequency;
+          extendBoundsToFit(freq);
+          const sanitized = clampToBounds(freq);
+          state.desiredFrequency = sanitized;
+          state.lastBroadcastedFrequency = sanitized;
+          if (state.pendingSend) {
+            clearTimeout(state.pendingSend);
+            state.pendingSend = null;
+          }
+          state.queuedFrequency = null;
+          state.applyingRemoteUpdate = true;
+          slider.value = String(sanitized);
+          state.applyingRemoteUpdate = false;
+          playFrequency(sanitized);
+          if (!Number.isFinite(previous) || previous !== sanitized) {
+            log(`Frecuencia sincronizada: ${sanitized} Hz`);
+          }
         };
       }
 
-      enableButton.addEventListener("click", () => {
-        ensureAudioChain();
-        gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
-        enableButton.disabled = true;
-        enableButton.textContent = "Audio Ready";
-        log("Audio output enabled by user");
-      });
-
-      document.addEventListener("visibilitychange", () => {
-        if (document.visibilityState === "hidden" && audioContext) {
-          audioContext.resume();
-        }
-      });
-
-      window.addEventListener("focus", () => {
-        if (audioContext && audioContext.state === "suspended") {
-          audioContext.resume();
-        }
-      });
+      sanitizeBounds();
+      state.desiredFrequency = clampToBounds(state.desiredFrequency);
+      slider.value = String(state.desiredFrequency);
+      sliderValueEl.textContent = `${state.desiredFrequency} Hz`;
 
       connectWebSocket();
     </script>
@@ -295,16 +528,21 @@ const uint16_t toneFrequencies[] = {261, 329, 392, 440, 523, 659};
 constexpr size_t toneCount = sizeof(toneFrequencies) / sizeof(toneFrequencies[0]);
 size_t currentToneIndex = 0;
 String lastFrequencyStr = String(toneFrequencies[0]);
+constexpr uint16_t kFrequencyMin = 60;   // Guard rails for inbound frequency commands
+constexpr uint16_t kFrequencyMax = 5000; // Upper bound to avoid abusive values
+uint16_t lastBroadcastFrequency = toneFrequencies[0];
 String ipString = "0.0.0.0";
 volatile uint8_t apClientCount = 0;
 uint16_t connectedClientCount = 0;
 bool apReady = false;
 
 // ********** Forward declarations **********
-void broadcastFrequency(uint16_t frequency);
+void broadcastFrequency(uint16_t frequency, bool force = false);
 void refreshDisplay();
 void handleWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t *payload, size_t length);
 void onWiFiEvent(WiFiEvent_t event, WiFiEventInfo_t info);
+bool tryParseFrequencyCommand(const String &payload, uint16_t &frequencyOut);
+size_t findClosestToneIndex(uint16_t frequency);
 
 void refreshDisplay() {
   const String line1 = apReady ? String("AP: ") + AP_SSID : "AP: starting...";
@@ -316,10 +554,75 @@ void refreshDisplay() {
   display.showLines(line1, line2, line3);
 }
 
-void broadcastFrequency(uint16_t frequency) {
+void broadcastFrequency(uint16_t frequency, bool force) {
+  if (!force && frequency == lastBroadcastFrequency) {
+    return;
+  }
+  lastBroadcastFrequency = frequency;
   lastFrequencyStr = String(frequency);
   webSocket.broadcastTXT(lastFrequencyStr);
   refreshDisplay();
+}
+
+bool tryParseFrequencyCommand(const String &payload, uint16_t &frequencyOut) {
+  String trimmed = payload;
+  trimmed.trim();
+  if (trimmed.length() == 0) {
+    return false;
+  }
+
+  String lower = trimmed;
+  lower.toLowerCase();
+  int separatorIndex = lower.indexOf(':');
+  if (separatorIndex < 0) {
+    separatorIndex = lower.indexOf('=');
+  }
+
+  String numericPortion;
+  if (separatorIndex > 0) {
+    const String key = lower.substring(0, separatorIndex);
+    if (key != "freq" && key != "frequency") {
+      return false;
+    }
+    numericPortion = trimmed.substring(separatorIndex + 1);
+  } else {
+    numericPortion = trimmed;
+  }
+
+  numericPortion.trim();
+  if (numericPortion.length() == 0) {
+    return false;
+  }
+
+  const float parsed = numericPortion.toFloat();
+  if (!(parsed > 0.0f)) {
+    return false;
+  }
+
+  uint16_t frequencyCandidate = static_cast<uint16_t>(parsed + 0.5f);
+  if (frequencyCandidate < kFrequencyMin) {
+    frequencyCandidate = kFrequencyMin;
+  } else if (frequencyCandidate > kFrequencyMax) {
+    frequencyCandidate = kFrequencyMax;
+  }
+
+  frequencyOut = frequencyCandidate;
+  return true;
+}
+
+size_t findClosestToneIndex(uint16_t frequency) {
+  size_t closestIndex = 0;
+  uint32_t smallestDelta = toneFrequencies[0] > frequency ? (toneFrequencies[0] - frequency)
+                                                         : (frequency - toneFrequencies[0]);
+  for (size_t i = 1; i < toneCount; ++i) {
+    const uint32_t delta = toneFrequencies[i] > frequency ? (toneFrequencies[i] - frequency)
+                                                          : (frequency - toneFrequencies[i]);
+    if (delta < smallestDelta) {
+      smallestDelta = delta;
+      closestIndex = i;
+    }
+  }
+  return closestIndex;
 }
 
 void startAccessPoint() {
@@ -372,10 +675,11 @@ void handleWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t *payload, si
       if (payloadStr.equalsIgnoreCase("next")) {
         currentToneIndex = (currentToneIndex + 1) % toneCount;
         broadcastFrequency(toneFrequencies[currentToneIndex]);
-      } else if (payloadStr.length() > 0) {
-        int requested = payloadStr.toInt();
-        if (requested > 0) {
-          broadcastFrequency(static_cast<uint16_t>(requested));
+      } else {
+        uint16_t requestedFrequency = 0;
+        if (tryParseFrequencyCommand(payloadStr, requestedFrequency)) {
+          currentToneIndex = findClosestToneIndex(requestedFrequency);
+          broadcastFrequency(requestedFrequency);
         }
       }
       connectedClientCount = webSocket.connectedClients();
@@ -426,7 +730,7 @@ void setup() {
   startAccessPoint();
   setupWebServer();
 
-  broadcastFrequency(toneFrequencies[currentToneIndex]);
+  broadcastFrequency(toneFrequencies[currentToneIndex], true);
 }
 
 void loop() {
