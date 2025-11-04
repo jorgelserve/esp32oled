@@ -3,6 +3,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WebSocketsServer.h>
+#include <cstdio>
+#include <cstring>
 #include "web_bundle.h"
 
 // ********** Access Point configuration **********
@@ -33,19 +35,37 @@ class OledDisplay {
     u8g2.setFont(u8g2_font_6x10_tf);
   }
 
-  void showLines(const String &line1, const String &line2, const String &line3) {
+  void showLines(const String &line1, const String &line2, const String &line3, int16_t line2PrimaryX = 0,
+                 bool drawWrapped = false, int16_t line2WrappedX = 0) {
     u8g2.clearBuffer();
     if (line1.length()) {
-      u8g2.drawStr(0, 10, line1.c_str());
+      u8g2.drawUTF8(0, 10, line1.c_str());
     }
     if (line2.length()) {
-      u8g2.drawStr(0, 20, line2.c_str());
+      u8g2.drawUTF8(line2PrimaryX, 20, line2.c_str());
+      if (drawWrapped) {
+        u8g2.drawUTF8(line2WrappedX, 20, line2.c_str());
+      }
     }
     if (line3.length()) {
-      u8g2.drawStr(0, 30, line3.c_str());
+      u8g2.drawUTF8(0, 30, line3.c_str());
     }
     u8g2.sendBuffer();
   }
+
+  void beginFrame() { u8g2.clearBuffer(); }
+
+  void endFrame() { u8g2.sendBuffer(); }
+
+  void drawText(int16_t x, int16_t y, const char *text) { u8g2.drawUTF8(x, y, text); }
+
+  void drawText(int16_t x, int16_t y, const String &text) { drawText(x, y, text.c_str()); }
+
+  uint16_t textWidth(const char *text) { return u8g2.getUTF8Width(text); }
+
+  uint16_t textWidth(const String &text) { return textWidth(text.c_str()); }
+
+  uint8_t width() { return u8g2.getDisplayWidth(); }
 };
 
 class LedController {
@@ -137,6 +157,14 @@ volatile uint8_t apClientCount = 0;
 uint16_t connectedClientCount = 0;
 bool apReady = false;
 
+constexpr uint8_t kUiScreenCount = 3;
+uint8_t currentUiScreen = 0;
+bool displayDirty = true;
+uint32_t lastDisplayFrameMs = 0;
+constexpr uint16_t kDisplayFrameIntervalMs = 125;
+constexpr uint16_t kMarqueeGapPx = 12;
+constexpr uint16_t kMarqueeStepMs = 45;
+
 // ********** Forward declarations **********
 void broadcastNormalizedValue(float normalized, bool force = false);
 void refreshDisplay();
@@ -147,16 +175,7 @@ size_t findClosestToneIndex(uint16_t frequency);
 float frequencyToNormalized(float frequency);
 float normalizedToFrequency(float normalized);
 
-void refreshDisplay() {
-  const String line1 = apReady ? String("AP: ") + AP_SSID : "AP: starting...";
-  const float displayFrequency = normalizedToFrequency(currentNormalizedValue);
-  String line2 = "IP: " + ipString;
-  String line3 = "N:" + String(currentNormalizedValue, 2) + " F:" + String(displayFrequency, 0);
-  if (apClientCount > 0 || connectedClientCount > 0) {
-    line3 += " C:" + String(apClientCount) + "/" + String(connectedClientCount);
-  }
-  display.showLines(line1, line2, line3);
-}
+void refreshDisplay() { displayDirty = true; }
 
 float clampNormalized(float value) {
   if (value < 0.0f) {
@@ -180,6 +199,34 @@ float frequencyToNormalized(float frequency) {
 float normalizedToFrequency(float normalized) {
   const float span = kDefaultRangeMaxHz - kDefaultRangeMinHz;
   return kDefaultRangeMinHz + clampNormalized(normalized) * span;
+}
+
+int16_t computeMarqueePrimaryX(const char *text, uint32_t now) {
+  const uint16_t textPixelWidth = display.textWidth(text);
+  const uint8_t screenWidth = display.width();
+  if (textPixelWidth <= screenWidth) {
+    return 0;
+  }
+  const uint16_t travel = textPixelWidth + screenWidth + kMarqueeGapPx;
+  const uint32_t step = (now / kMarqueeStepMs) % travel;
+  return static_cast<int16_t>(screenWidth) - static_cast<int16_t>(step);
+}
+
+void drawMarqueeLine(const char *text, int16_t y, uint32_t now) {
+  const uint16_t textPixelWidth = display.textWidth(text);
+  const uint8_t screenWidth = display.width();
+  if (textPixelWidth <= screenWidth) {
+    display.drawText(0, y, text);
+    return;
+  }
+
+  const int16_t primaryX = computeMarqueePrimaryX(text, now);
+  display.drawText(primaryX, y, text);
+  display.drawText(primaryX + textPixelWidth + kMarqueeGapPx, y, text);
+}
+
+void drawMarqueeLine(const String &text, int16_t y, uint32_t now) {
+  drawMarqueeLine(text.c_str(), y, now);
 }
 
 void broadcastNormalizedValue(float normalized, bool force) {
@@ -248,6 +295,60 @@ size_t findClosestToneIndex(uint16_t frequency) {
     }
   }
   return closestIndex;
+}
+
+void renderOverviewScreen(uint32_t now) {
+  display.drawText(0, 10, apReady ? "AP Ready" : "AP Boot");
+  char ipLine[24];
+  snprintf(ipLine, sizeof(ipLine), "IP %s", ipString.c_str());
+  drawMarqueeLine(ipLine, 20, now);
+  char clientLine[24];
+  snprintf(clientLine, sizeof(clientLine), "STA %u WS %u", static_cast<unsigned>(apClientCount),
+           static_cast<unsigned>(connectedClientCount));
+  display.drawText(0, 30, clientLine);
+}
+
+void renderToneScreen(uint32_t now) {
+  (void)now;
+  display.drawText(0, 10, "Tone Ctl");
+  char normLine[24];
+  snprintf(normLine, sizeof(normLine), "Norm %.3f", static_cast<double>(currentNormalizedValue));
+  display.drawText(0, 20, normLine);
+  char freqLine[24];
+  snprintf(freqLine, sizeof(freqLine), "Freq %.0f Hz", static_cast<double>(normalizedToFrequency(currentNormalizedValue)));
+  display.drawText(0, 30, freqLine);
+}
+
+void renderInfoScreen(uint32_t now) {
+  display.drawText(0, 10, "BTN: Next");
+  char ssidLine[32];
+  snprintf(ssidLine, sizeof(ssidLine), "SSID %s", AP_SSID);
+  drawMarqueeLine(ssidLine, 20, now);
+  const char *password = strlen(AP_PASSWORD) > 0 ? AP_PASSWORD : "(open)";
+  char pwdLine[32];
+  snprintf(pwdLine, sizeof(pwdLine), "PWD %s", password);
+  drawMarqueeLine(pwdLine, 30, now);
+}
+
+void renderCurrentScreen(uint32_t now) {
+  display.beginFrame();
+  switch (currentUiScreen) {
+    case 0:
+      renderOverviewScreen(now);
+      break;
+    case 1:
+      renderToneScreen(now);
+      break;
+    case 2:
+      renderInfoScreen(now);
+      break;
+    default:
+      renderOverviewScreen(now);
+      break;
+  }
+  display.endFrame();
+  lastDisplayFrameMs = now;
+  displayDirty = false;
 }
 
 void startAccessPoint() {
@@ -353,6 +454,8 @@ void setup() {
   Serial.println();
   Serial.println("ESP32 WebTone starting");
 
+  setCpuFrequencyMhz(80);
+
   display.begin();
   display.showLines("Booting...", "", "");
 
@@ -368,10 +471,15 @@ void loop() {
   server.handleClient();
   webSocket.loop();
 
+  const uint32_t now = millis();
+
   if (selectorButton.wasPressed()) {
-    currentToneIndex = (currentToneIndex + 1) % toneCount;
-    const float normalized = frequencyToNormalized(static_cast<float>(toneFrequencies[currentToneIndex]));
-    broadcastNormalizedValue(normalized);
+    currentUiScreen = (currentUiScreen + 1) % kUiScreenCount;
     statusLed.toggle();
+    refreshDisplay();
+  }
+
+  if (displayDirty || (now - lastDisplayFrameMs) >= kDisplayFrameIntervalMs) {
+    renderCurrentScreen(now);
   }
 }
