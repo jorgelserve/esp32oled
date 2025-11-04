@@ -398,6 +398,10 @@ void handleWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t *payload, si
       String payloadStr(reinterpret_cast<char *>(payload), length);
       payloadStr.trim();
       Serial.printf("Received data from client #%u: %s\n", clientNum, payloadStr.c_str());
+      if (payloadStr.equalsIgnoreCase("ping")) {
+        webSocket.sendTXT(clientNum, "pong");
+        break;
+      }
       if (payloadStr.equalsIgnoreCase("next")) {
         currentToneIndex = (currentToneIndex + 1) % toneCount;
         const float normalized = frequencyToNormalized(static_cast<float>(toneFrequencies[currentToneIndex]));
@@ -443,6 +447,7 @@ void setupWebServer() {
   });
 
   webSocket.begin();
+  webSocket.enableHeartbeat(15000, 3000, 2);
   webSocket.onEvent(handleWebSocketEvent);
   server.begin();
   Serial.println("HTTP and WebSocket servers started");

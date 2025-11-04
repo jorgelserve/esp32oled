@@ -106,6 +106,51 @@
         overflow-y: auto;
         white-space: pre-line;
       }
+      .toast-stack {
+        position: fixed;
+        top: 1rem;
+        right: 1rem;
+        display: flex;
+        flex-direction: column;
+        gap: 0.5rem;
+        z-index: 1000;
+        pointer-events: none;
+      }
+      .toast {
+        min-width: 200px;
+        max-width: 280px;
+        border-radius: 12px;
+        padding: 0.65rem 0.9rem;
+        font-size: 0.85rem;
+        color: #0f172a;
+        background: rgba(255,255,255,0.92);
+        box-shadow: 0 15px 30px -20px rgba(15,23,42,0.6);
+        border: 1px solid rgba(148,163,184,0.45);
+        animation: toast-slide 120ms ease-out;
+        pointer-events: auto;
+      }
+      .toast.info {
+        border-color: rgba(37,99,235,0.35);
+      }
+      .toast.success {
+        border-color: rgba(34,197,94,0.35);
+      }
+      .toast.warning {
+        border-color: rgba(250,204,21,0.45);
+      }
+      .toast.error {
+        border-color: rgba(248,113,113,0.55);
+      }
+      @keyframes toast-slide {
+        from {
+          opacity: 0;
+          transform: translateX(40px);
+        }
+        to {
+          opacity: 1;
+          transform: translateX(0);
+        }
+      }
     </style>
   </head>
   <body>
@@ -138,6 +183,7 @@
       </p>
       <div class="log" id="log"></div>
     </main>
+    <div class="toast-stack" id="toastStack"></div>
     <script>
       const connectionEl = document.getElementById("connection");
       const updatedEl = document.getElementById("updated");
@@ -148,6 +194,64 @@
       const sliderValueEl = document.getElementById("sliderValue");
       const normalizedValueEl = document.getElementById("normalizedValue");
       const minInput = document.getElementById("minFrequency");
+      const toastStack = document.getElementById("toastStack");
+
+      let reconnectAttempt = 0;
+      let reconnectTimeout = null;
+      const MAX_RECONNECT_DELAY = 15000;
+      const BASE_RECONNECT_DELAY = 1500;
+      const ERROR_TOAST_COOLDOWN = 4000;
+      let lastErrorToastAt = 0;
+      const HEARTBEAT_INTERVAL = 5000;
+      const HEARTBEAT_TIMEOUT = 9000;
+      let heartbeatTimer = null;
+      let lastPongAt = 0;
+
+      function showToast(message, type = "info", timeout = 3500) {
+        if (!toastStack) {
+          return;
+        }
+        const toast = document.createElement("div");
+        toast.className = `toast ${type}`;
+        toast.textContent = message;
+        toastStack.appendChild(toast);
+        const remove = () => {
+          if (toast.parentElement) {
+            toast.parentElement.removeChild(toast);
+          }
+        };
+        toast.addEventListener("click", remove, { once: true });
+        setTimeout(remove, timeout);
+      }
+
+      function stopHeartbeat() {
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
+        }
+      }
+
+      function startHeartbeat() {
+        stopHeartbeat();
+        lastPongAt = Date.now();
+        heartbeatTimer = setInterval(() => {
+          if (!websocket || websocket.readyState !== WebSocket.OPEN) {
+            return;
+          }
+          const now = Date.now();
+          if (now - lastPongAt > HEARTBEAT_TIMEOUT) {
+            log("Heartbeat timeout; cerrando socket");
+            websocket.close();
+            return;
+          }
+          try {
+            websocket.send("ping");
+          } catch (sendError) {
+            log(`Error enviando ping: ${sendError}`);
+          }
+        }, HEARTBEAT_INTERVAL);
+      }
+
       const maxInput = document.getElementById("maxFrequency");
 
       let audioContext;
@@ -346,27 +450,52 @@
       });
 
       function connectWebSocket() {
+        stopHeartbeat();
+        if (reconnectTimeout) {
+          clearTimeout(reconnectTimeout);
+          reconnectTimeout = null;
+        }
         const protocol = location.protocol === "https:" ? "wss" : "ws";
         websocket = new WebSocket(`${protocol}://${location.hostname}:${81}/`);
         websocket.onopen = () => {
+          reconnectAttempt = 0;
+          lastErrorToastAt = 0;
+          lastPongAt = Date.now();
           connectionEl.textContent = "connected";
           connectionEl.style.color = "green";
           log("WebSocket connected");
+          showToast("Conexión establecida", "success", 2500);
+          startHeartbeat();
           pushNormalized(state.normalized, { force: true });
           if (state.queuedNormalized !== null) {
             pushNormalized(state.queuedNormalized, { force: true });
           }
         };
         websocket.onclose = () => {
-          connectionEl.textContent = "disconnected (retrying...)";
+          stopHeartbeat();
+          connectionEl.textContent = "disconnected (reconnecting...)";
           connectionEl.style.color = "red";
-          log("WebSocket disconnected; retrying in 2s");
-          setTimeout(connectWebSocket, 2000);
+          log("WebSocket disconnected; scheduling reconnect");
+          if (reconnectAttempt === 0) {
+            showToast("Conexión perdida, reintentando...", "warning");
+          }
+          const delay = Math.min(BASE_RECONNECT_DELAY * 2 ** reconnectAttempt, MAX_RECONNECT_DELAY);
+          reconnectAttempt = Math.min(reconnectAttempt + 1, 6);
+          reconnectTimeout = setTimeout(connectWebSocket, delay);
         };
         websocket.onerror = (error) => {
           log(`Socket error: ${error.message || error}`);
+          const now = Date.now();
+          if (now - lastErrorToastAt > ERROR_TOAST_COOLDOWN) {
+            showToast("Error en la conexión WS", "error");
+            lastErrorToastAt = now;
+          }
         };
         websocket.onmessage = (event) => {
+          if (event.data === "pong") {
+            lastPongAt = Date.now();
+            return;
+          }
           const parsed = parseFloat(event.data);
           if (!Number.isFinite(parsed)) {
             log(`Ignored non-numeric payload: ${event.data}`);
