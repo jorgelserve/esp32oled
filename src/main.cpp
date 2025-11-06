@@ -142,6 +142,8 @@ Button selectorButton(9);
 WebServer server(80);
 WebSocketsServer webSocket(kWebSocketPort);
 
+constexpr uint8_t kPotentiometerPin = 4;  // ADC1_CH4 on ESP32-C3
+
 const uint16_t toneFrequencies[] = {261, 329, 392, 440, 523, 659};
 constexpr size_t toneCount = sizeof(toneFrequencies) / sizeof(toneFrequencies[0]);
 constexpr float kDefaultRangeMinHz = 120.0f;
@@ -477,6 +479,12 @@ void loop() {
   webSocket.loop();
 
   const uint32_t now = millis();
+
+  {
+    const int adcValue = analogRead(kPotentiometerPin);
+    const float normalized = static_cast<float>(adcValue) / 4095.0f;
+    broadcastNormalizedValue(normalized);
+  }
 
   if (selectorButton.wasPressed()) {
     currentUiScreen = (currentUiScreen + 1) % kUiScreenCount;
