@@ -177,6 +177,7 @@
         </div>
       </section>
       <button id="enable">Enable Audio Output</button>
+      <button id="stop">Stop Tone</button>
       <p class="status">
         <strong>Connection:</strong> <span id="connection">connecting...</span><br />
         <strong>Last update:</strong> <span id="updated">never</span>
@@ -266,6 +267,7 @@
         pendingSend: null,
         queuedNormalized: null,
         applyingRemoteUpdate: false,
+        isToneStopped: false,
       };
 
       let bounds = null;
@@ -282,8 +284,9 @@
           oscillator = audioContext.createOscillator();
           oscillator.type = "sine";
           gainNode = audioContext.createGain();
-          gainNode.gain.value = 0;
+          gainNode.gain.value = 0; // Start with muted
           oscillator.connect(gainNode).connect(audioContext.destination);
+          // Start the oscillator immediately but with 0 gain (muted)
           oscillator.start();
         }
         if (audioContext.state === "suspended") {
@@ -350,15 +353,99 @@
         return min + clampNormalized(normalized) * span;
       }
 
-      function updateDisplayFromNormalized(normalized) {
+      function updateDisplayFromNormalized(normalized, skipAudioUpdate = false) {
         const visibleFrequency = frequencyFromNormalized(normalized);
         frequencyEl.textContent = `${visibleFrequency.toFixed(2)} Hz`;
         sliderValueEl.textContent = `${visibleFrequency.toFixed(2)} Hz`;
         normalizedValueEl.textContent = normalized.toFixed(3);
         ensureAudioChain();
-        oscillator.frequency.setTargetAtTime(visibleFrequency, audioContext.currentTime, 0.01);
-        gainNode.gain.setTargetAtTime(0.18, audioContext.currentTime, 0.02);
+        
+        if (!skipAudioUpdate && audioContext && oscillator && gainNode) {
+          if (audioContext.state === "suspended") {
+            audioContext.resume().then(() => {
+              if (!state.isToneStopped) {
+                // Only update frequency and set gain to 0.18 if not stopped
+                oscillator.frequency.setValueAtTime(visibleFrequency, audioContext.currentTime);
+                gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
+              } else {
+                // When stopped, only set gain to 0, don't update frequency
+                gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+              }
+            });
+          } else {
+            if (!state.isToneStopped) {
+              // Only update frequency and set gain to 0.18 if not stopped
+              oscillator.frequency.setValueAtTime(visibleFrequency, audioContext.currentTime);
+              gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
+            } else {
+              // When stopped, only set gain to 0, don't update frequency
+              gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+            }
+          }
+        }
         updatedEl.textContent = new Date().toLocaleTimeString();
+      }
+
+      function stopTone() {
+        if (audioContext && gainNode) {
+          if (audioContext.state === "suspended") {
+            audioContext.resume().then(() => {
+              gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+              state.isToneStopped = true;
+              frequencyEl.textContent = "Tone Stopped";
+              log("Tone stopped");
+            }).catch(e => {
+              console.error("Error resuming audio context:", e);
+              // Even if we can't manipulate audio, still update the UI state
+              state.isToneStopped = true;
+              frequencyEl.textContent = "Tone Stopped";
+              log("Tone stopped (UI state updated)");
+            });
+          } else {
+            gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+            state.isToneStopped = true;
+            frequencyEl.textContent = "Tone Stopped";
+            log("Tone stopped");
+          }
+        } else {
+          // If audioContext doesn't exist yet, just update state
+          state.isToneStopped = true;
+          frequencyEl.textContent = "Tone Stopped";
+          log("Tone stopped (no audio context)");
+        }
+      }
+
+      function resumeTone(normalized) {
+        if (audioContext && oscillator && gainNode) {
+          const visibleFrequency = frequencyFromNormalized(normalized);
+          
+          if (audioContext.state === "suspended") {
+            audioContext.resume().then(() => {
+              oscillator.frequency.setValueAtTime(visibleFrequency, audioContext.currentTime);
+              gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
+              state.isToneStopped = false;
+              frequencyEl.textContent = `${visibleFrequency.toFixed(2)} Hz`;
+              log("Tone resumed");
+            }).catch(e => {
+              console.error("Error resuming audio context:", e);
+              // Update UI even if audio doesn't resume
+              state.isToneStopped = false;
+              frequencyEl.textContent = `${visibleFrequency.toFixed(2)} Hz`;
+            });
+          } else {
+            oscillator.frequency.setValueAtTime(visibleFrequency, audioContext.currentTime);
+            gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
+            state.isToneStopped = false;
+            frequencyEl.textContent = `${visibleFrequency.toFixed(2)} Hz`;
+            log("Tone resumed");
+          }
+        } else {
+          // If audio context doesn't exist, just update state
+          state.isToneStopped = false;
+          const visibleFrequency = frequencyFromNormalized(normalized);
+          frequencyEl.textContent = `${visibleFrequency.toFixed(2)} Hz`;
+          log("Tone state updated (no audio context)");
+        }
       }
 
       function pushNormalized(normalized, options = {}) {
@@ -403,7 +490,13 @@
         }
         const normalized = clampNormalized(Number(slider.value) / NORMALIZED_SCALE);
         state.normalized = normalized;
-        updateDisplayFromNormalized(normalized);
+        // If tone was stopped, resume it when user adjusts the slider
+        if (state.isToneStopped) {
+          resumeTone(normalized);
+          updateDisplayFromNormalized(normalized, true);  // Skip audio update since resumeTone handled it
+        } else {
+          updateDisplayFromNormalized(normalized);  // Normal update including audio
+        }
         queueNormalizedBroadcast(normalized);
       }
 
@@ -431,10 +524,51 @@
 
       enableButton.addEventListener("click", () => {
         ensureAudioChain();
-        gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
+        if (state.isToneStopped) {
+          // If tone was stopped, restore previous frequency instead of just enabling
+          const visibleFrequency = frequencyFromNormalized(state.normalized);
+          if (audioContext.state === "suspended") {
+            audioContext.resume().then(() => {
+              oscillator.frequency.setValueAtTime(visibleFrequency, audioContext.currentTime);
+              gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
+              state.isToneStopped = false;
+              frequencyEl.textContent = `${visibleFrequency.toFixed(2)} Hz`;
+            });
+          } else {
+            oscillator.frequency.setValueAtTime(visibleFrequency, audioContext.currentTime);
+            gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
+            state.isToneStopped = false;
+            frequencyEl.textContent = `${visibleFrequency.toFixed(2)} Hz`;
+          }
+        } else {
+          if (audioContext.state === "suspended") {
+            audioContext.resume().then(() => {
+              gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
+            });
+          } else {
+            gainNode.gain.setValueAtTime(0.18, audioContext.currentTime);
+          }
+        }
         enableButton.disabled = true;
         enableButton.textContent = "Audio Ready";
         log("Audio output enabled by user");
+      });
+
+      const stopButton = document.getElementById("stop");
+      stopButton.addEventListener("click", () => {
+        if (websocket && websocket.readyState === WebSocket.OPEN) {
+          try {
+            websocket.send("stop");
+            state.isToneStopped = true;
+            log("Stop command sent to ESP32");
+            showToast("Tone stopped", "info", 2000);
+          } catch (error) {
+            log(`Error sending stop command: ${error}`);
+          }
+        } else {
+          log("Cannot send stop command: WebSocket not connected");
+          showToast("WebSocket not connected", "error");
+        }
       });
 
       document.addEventListener("visibilitychange", () => {
@@ -496,6 +630,12 @@
             lastPongAt = Date.now();
             return;
           }
+          if (event.data === "stop") {
+            stopTone();
+            showToast("Tone stopped by ESP32", "info", 3000);
+            // Update slider display to indicate stopped state if needed
+            return;
+          }
           const parsed = parseFloat(event.data);
           if (!Number.isFinite(parsed)) {
             log(`Ignored non-numeric payload: ${event.data}`);
@@ -514,7 +654,9 @@
           state.applyingRemoteUpdate = true;
           slider.value = String(scaled);
           state.applyingRemoteUpdate = false;
-          updateDisplayFromNormalized(normalized);
+          resumeTone(normalized);
+          // Skip audio update since resumeTone already handled it
+          updateDisplayFromNormalized(normalized, true);
           if (!Number.isFinite(previous) || previous !== scaled) {
             log(`Valor sincronizado: ${normalized.toFixed(3)}`);
           }
@@ -525,6 +667,7 @@
       state.normalized = clampNormalized(state.normalized);
       slider.value = String(Math.round(state.normalized * NORMALIZED_SCALE));
       updateDisplayFromNormalized(state.normalized);
+      state.isToneStopped = false;  // Initialize to not stopped
 
       connectWebSocket();
     </script>

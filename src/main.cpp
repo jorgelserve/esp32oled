@@ -17,8 +17,19 @@ const IPAddress AP_GW(192, 168, 4, 1);
 const IPAddress AP_SUBNET(255, 255, 255, 0);
 
 // ********** Web resources **********
-constexpr uint16_t kWebSocketPort = 81;
-
+#define kWebSocketPort 81  // Web socket port
+#define kNormalizedScale 1000  // Precision for debouncing broadcasts
+#define kPotentiometerDeltaThreshold 0.005f  // Minimum change to trigger broadcast (0.5%)
+#define kAdcFilterAlpha 0.1f  // Alpha value for exponential moving average (0.1 = more smoothing)
+#define kUiScreenCount 3  // Number of UI screens
+#define kDisplayFrameIntervalMs 125  // Display refresh interval in ms
+#define kMarqueeGapPx 12  // Gap in pixels for marquee text
+#define kMarqueeStepMs 45  // Marquee animation step in ms
+#define kPotentiometerPin 4  // ADC1_CH4 on ESP32-C3
+#define kDefaultRangeMinHz 120.0f  // Default frequency range minimum
+#define kDefaultRangeMaxHz 1200.0f  // Default frequency range maximum
+#define kNormalizedScaleFloat 1000.0f  // Float version for calculations
+#define kDebounceDelay 50  // Button debounce delay in ms
 
 
 // ********** UI helpers **********
@@ -139,18 +150,15 @@ class Button {
 OledDisplay display;
 LedController statusLed(8);
 Button selectorButton(9);
+Button stopButton(7);  // New stop button on pin 7
 WebServer server(80);
 WebSocketsServer webSocket(kWebSocketPort);
 
-constexpr uint8_t kPotentiometerPin = 4;  // ADC1_CH4 on ESP32-C3
-
 const uint16_t toneFrequencies[] = {261, 329, 392, 440, 523, 659};
-constexpr size_t toneCount = sizeof(toneFrequencies) / sizeof(toneFrequencies[0]);
-constexpr float kDefaultRangeMinHz = 120.0f;
-constexpr float kDefaultRangeMaxHz = 1200.0f;
-constexpr uint16_t kNormalizedScale = 1000;  // Precision for debouncing broadcasts
+const size_t toneCount = sizeof(toneFrequencies) / sizeof(toneFrequencies[0]);
 
 float currentNormalizedValue = 0.0f;
+float filteredNormalizedValue = 0.0f;  // Filtered value for smoothing
 size_t currentToneIndex = 0;
 String lastNormalizedStr = String("0.0000");
 uint16_t lastBroadcastNormalizedScaled = kNormalizedScale + 1;
@@ -158,14 +166,11 @@ String ipString = "0.0.0.0";
 volatile uint8_t apClientCount = 0;
 uint16_t connectedClientCount = 0;
 bool apReady = false;
+bool toneStopped = false;  // New state to track if tone should be stopped
 
-constexpr uint8_t kUiScreenCount = 3;
 uint8_t currentUiScreen = 0;
 bool displayDirty = true;
 uint32_t lastDisplayFrameMs = 0;
-constexpr uint16_t kDisplayFrameIntervalMs = 125;
-constexpr uint16_t kMarqueeGapPx = 12;
-constexpr uint16_t kMarqueeStepMs = 45;
 
 // ********** Forward declarations **********
 void broadcastNormalizedValue(float normalized, bool force = false);
@@ -386,7 +391,12 @@ void handleWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t *payload, si
     case WStype_CONNECTED: {
       IPAddress ip = webSocket.remoteIP(clientNum);
       Serial.printf("WebSocket client #%u connected from %s\n", clientNum, ip.toString().c_str());
-      webSocket.sendTXT(clientNum, lastNormalizedStr);
+      // Send appropriate message based on current state
+      if (toneStopped) {
+        webSocket.sendTXT(clientNum, "stop");
+      } else {
+        webSocket.sendTXT(clientNum, lastNormalizedStr);
+      }
       connectedClientCount = webSocket.connectedClients();
       refreshDisplay();
       break;
@@ -407,12 +417,21 @@ void handleWebSocketEvent(uint8_t clientNum, WStype_t type, uint8_t *payload, si
       if (payloadStr.equalsIgnoreCase("next")) {
         currentToneIndex = (currentToneIndex + 1) % toneCount;
         const float normalized = frequencyToNormalized(static_cast<float>(toneFrequencies[currentToneIndex]));
+        toneStopped = false; // Reset stop state when changing tone
+        filteredNormalizedValue = normalized; // Update filtered value to match
         broadcastNormalizedValue(normalized);
+      } else if (payloadStr.equalsIgnoreCase("stop")) {
+        // Set the stop state and broadcast "stop" command
+        toneStopped = true;
+        webSocket.broadcastTXT("stop");
+        Serial.println("Tone stopped command received and broadcast to all clients");
       } else {
         float requestedNormalized = 0.0f;
         if (tryParseNormalizedCommand(payloadStr, requestedNormalized)) {
           const float requestedFrequency = normalizedToFrequency(requestedNormalized);
           currentToneIndex = findClosestToneIndex(static_cast<uint16_t>(requestedFrequency + 0.5f));
+          toneStopped = false; // Reset stop state when setting specific value
+          filteredNormalizedValue = requestedNormalized; // Update filtered value to match
           broadcastNormalizedValue(requestedNormalized);
         }
       }
@@ -471,6 +490,7 @@ void setup() {
   setupWebServer();
 
   currentNormalizedValue = frequencyToNormalized(static_cast<float>(toneFrequencies[currentToneIndex]));
+  filteredNormalizedValue = currentNormalizedValue;  // Initialize filtered value
   broadcastNormalizedValue(currentNormalizedValue, true);
 }
 
@@ -482,13 +502,44 @@ void loop() {
 
   {
     const int adcValue = analogRead(kPotentiometerPin);
-    const float normalized = static_cast<float>(adcValue) / 4095.0f;
-    broadcastNormalizedValue(normalized);
+    const float rawNormalized = static_cast<float>(adcValue) / 4095.0f;
+    
+    // Apply exponential moving average filter to smooth the input
+    filteredNormalizedValue = kAdcFilterAlpha * rawNormalized + (1.0f - kAdcFilterAlpha) * filteredNormalizedValue;
+    
+    // Only broadcast potentiometer updates if tone is not stopped
+    if (!toneStopped) {
+      // Only broadcast if the change is significant enough to avoid noise
+      const float delta = abs(filteredNormalizedValue - currentNormalizedValue);
+      if (delta >= kPotentiometerDeltaThreshold) {
+        broadcastNormalizedValue(filteredNormalizedValue);
+      }
+    }
   }
 
   if (selectorButton.wasPressed()) {
     currentUiScreen = (currentUiScreen + 1) % kUiScreenCount;
     statusLed.toggle();
+    refreshDisplay();
+  }
+
+  // Check if the stop button is pressed
+  if (stopButton.wasPressed()) {
+    // Toggle between stopped and playing states
+    if (toneStopped) {
+      // Currently stopped, so resume
+      toneStopped = false;
+      // Update filtered value to current value to avoid jumps
+      filteredNormalizedValue = currentNormalizedValue;
+      // Send current normalized value to resume tone
+      webSocket.broadcastTXT(lastNormalizedStr);
+      Serial.println("Tone resumed via hardware button");
+    } else {
+      // Currently playing, so stop
+      toneStopped = true;
+      webSocket.broadcastTXT("stop");
+      Serial.println("Tone stopped via hardware button");
+    }
     refreshDisplay();
   }
 
